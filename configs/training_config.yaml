@@ -1,0 +1,214 @@
+# SEC Filing Analyst — Fine-tuning Configuration
+# All hyperparameters documented with rationale.
+# Change values here, never in train.py.
+
+model:
+  base_model: "mistralai/Mistral-7B-Instruct-v0.2"
+  # Why Mistral-7B-Instruct-v0.2 and not v0.3 or LLaMA 3.1?
+  #
+  # vs Mistral v0.3: v0.3 added function calling tokens that change
+  #   the tokenizer vocabulary. v0.2 is more stable for fine-tuning
+  #   and has more community-tested QLoRA recipes.
+  #
+  # vs LLaMA 3.1 8B: LLaMA 3.1 is slightly better on benchmarks but
+  #   requires a Meta access request. Mistral is Apache 2.0 licensed —
+  #   no restrictions on commercial use or distribution. For a portfolio
+  #   project you'll share publicly, license matters.
+  #
+  # vs Qwen 2.5 7B: Strong model, but less community tooling for finance.
+  #   Mistral has FinMistral variants and finance fine-tuning precedents.
+  #
+  # Production note: at a bank, you'd evaluate all three on an internal
+  # held-out benchmark before picking. We're making a principled choice
+  # based on license + community + domain precedent.
+
+  max_seq_length: 2048
+  # Why 2048?
+  # Our avg chunk = 771 words × 1.3 tokens/word ≈ 1002 tokens
+  # + instruction prefix ≈ 150 tokens
+  # + system prompt ≈ 80 tokens
+  # Total ≈ 1232 tokens. 2048 gives 800 token headroom for generation.
+  # Going to 4096 would double VRAM usage for marginal gain.
+  # Kaggle T4 has 16GB VRAM — 2048 is the safe ceiling for 7B QLoRA.
+
+  dtype: "bfloat16"
+  # Why bfloat16 over float16?
+  # bfloat16 has the same exponent range as float32 (8 bits) but only
+  # 7 mantissa bits vs float16's 10. This means bfloat16 handles the
+  # large gradient magnitudes in LLM training without overflow.
+  # float16 overflows and produces NaN losses — especially common with
+  # financial text which has extreme numeric values.
+  # bfloat16 requires Ampere GPU or newer (A100, T4, RTX 30xx+).
+  # Kaggle T4 supports it.
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+  # Why NF4 (NormalFloat4) over INT4?
+  # NF4 is information-theoretically optimal for normally distributed
+  # weights (which neural network weights are, by design).
+  # INT4 uses uniform quantization — equal spacing between levels.
+  # NF4 uses non-uniform spacing that matches the actual distribution
+  # of weights, recovering ~0.5-1% accuracy at the same bit width.
+  # This was the key insight of the QLoRA paper (Dettmers et al. 2023).
+  bnb_4bit_use_double_quant: true
+  # Double quantization: quantizes the quantization constants themselves
+  # from 32-bit to 8-bit. Saves ~0.4GB on a 7B model — meaningful on
+  # a 16GB GPU. Negligible accuracy impact.
+
+lora:
+  r: 16
+  # r = rank. The core LoRA hyperparameter.
+  # LoRA decomposes weight update ΔW into A×B where A is (d × r)
+  # and B is (r × d). Lower r = fewer trainable parameters.
+  #
+  # r=8:  ~0.1% of total params. Fast, low memory. Good for style.
+  # r=16: ~0.2% of total params. Our choice — balanced.
+  # r=32: ~0.4% of total params. Better for complex domain shift.
+  # r=64: ~0.8% of total params. Diminishing returns, paper shows r=16
+  #       matches r=64 on most tasks.
+  #
+  # We chose r=16 because: financial analysis requires moderate domain
+  # shift (SEC terminology, structured output style) but Mistral already
+  # has strong financial priors from pretraining on news/web text.
+  # r=16 is the industry default for domain adaptation tasks.
+
+  lora_alpha: 32
+  # Alpha scales the LoRA output: effective_lr = alpha/r × lr
+  # Convention: set alpha = 2×r for stable training.
+  # alpha=32 with r=16 gives scaling factor of 2.0.
+  # Some practitioners set alpha=r (scaling=1.0) for more conservative
+  # updates. We use 2×r as it converges faster on small datasets.
+
+  lora_dropout: 0.05
+  # Dropout on LoRA layers. Small value (0.05) because:
+  # - Our dataset is small (~850 samples) — we need some regularization
+  # - But too high (>0.1) hurts convergence on small datasets
+  # - 0.05 is the sweet spot from the original LoRA ablations
+
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  # Which weight matrices to adapt.
+  # q/k/v/o = attention projections (how the model attends)
+  # gate/up/down = feed-forward network (how the model transforms)
+  # Adapting ALL 7 module types gives maximum expressivity.
+  #
+  # Minimal alternative (attention only): q_proj + v_proj
+  # The original LoRA paper used only q+v and got good results.
+  # We add all 7 because our dataset is domain-specific and we want
+  # the model to adapt both its attention patterns AND its FFN
+  # transformations for financial text.
+  #
+  # What we deliberately exclude: embed_tokens and lm_head
+  # These are the input/output embedding layers. Adapting them with
+  # LoRA can destabilize training and usually hurts performance.
+
+  bias: "none"
+  # none / all / lora_only
+  # "none" = don't train any bias terms. Standard for LoRA.
+  # Training biases adds parameters but rarely helps. Keep "none".
+
+  task_type: "CAUSAL_LM"
+
+training:
+  num_train_epochs: 3
+  # Why 3 epochs?
+  # With ~720 training samples, 1 epoch is too few to learn domain style.
+  # 3 epochs = ~2160 gradient steps at batch_size=4 + grad_accum=4.
+  # Beyond 3 epochs on 850 samples = overfitting risk (memorization).
+  # Watch validation loss: if it rises while train loss falls, stop early.
+
+  per_device_train_batch_size: 2
+  # Kaggle T4 = 16GB VRAM. With 7B model in 4-bit:
+  # Model weights ≈ 3.5GB
+  # Activations + gradients per sample ≈ 0.8GB at seq_len=2048
+  # batch_size=2: 2×0.8 = 1.6GB activations → total ~5.5GB. Safe.
+  # batch_size=4: would push ~7GB — risky on T4 with other overhead.
+
+  gradient_accumulation_steps: 4
+  # Effective batch size = 2 × 4 = 8 samples per gradient update.
+  # This is the "virtual" batch size. Research shows batch size 8-16
+  # works well for instruction fine-tuning. We can't fit 8 in VRAM
+  # at once, so we accumulate gradients over 4 forward passes.
+  # Same math, spread across sequential steps.
+
+  learning_rate: 2.0e-4
+  # Standard for LoRA fine-tuning: 1e-4 to 2e-4 range.
+  # Higher than full fine-tuning (1e-5 to 5e-5) because:
+  # Only LoRA adapters are being trained — they start at zero
+  # and need to move quickly. The base model is frozen.
+  # 2e-4 is the most common value in published LoRA recipes.
+
+  lr_scheduler_type: "cosine"
+  # Cosine decay: starts at learning_rate, smoothly decays to near 0.
+  # Why cosine over linear?
+  # - Cosine has a slow start (warm region) and slow end (fine-tuning region)
+  # - The fast middle helps escape plateaus
+  # - Linear decay reaches zero too abruptly, cutting off late learning
+  # Alternative: "constant_with_warmup" — used when you're unsure about LR.
+
+  warmup_ratio: 0.03
+  # First 3% of steps use linearly increasing LR (0 → learning_rate).
+  # Why warmup? LoRA adapters start at zero. Hitting them with full
+  # learning rate at step 1 causes large gradient updates that destabilize
+  # the base model's representation. Warmup eases them in.
+  # 0.03 × total_steps ≈ 65 steps at our scale — standard.
+
+  weight_decay: 0.01
+  # L2 regularization. Small value because LoRA already constrains
+  # the parameter space (low-rank constraint acts as regularization).
+  # 0.01 is the AdamW default. Don't increase without validation evidence.
+
+  optim: "adamw_8bit"
+  # AdamW in 8-bit precision (via bitsandbytes).
+  # Standard AdamW stores 2 momentum states per parameter in float32.
+  # 8-bit AdamW quantizes these → ~4x memory savings on optimizer states.
+  # No meaningful accuracy difference. Production teams at Meta use this.
+  # Alternative: "paged_adamw_8bit" — pages optimizer states to CPU RAM
+  # when GPU is full. Use this if you hit OOM errors.
+
+  max_grad_norm: 1.0
+  # Gradient clipping. If gradient norm > 1.0, rescale to 1.0.
+  # Prevents the "exploding gradient" problem, especially important
+  # with financial text that contains extreme numeric values.
+
+  fp16: false
+  bf16: true
+  # As discussed in dtype config — bfloat16 for training stability.
+
+  gradient_checkpointing: true
+  # Trade compute for memory: instead of storing all activations for
+  # backprop, recompute them on the backward pass.
+  # Saves ~30% VRAM at ~20% compute cost. Essential on T4.
+
+  packing: false
+  # Sequence packing: fits multiple short sequences into one context
+  # window to improve GPU utilization.
+  # We set false because our sequences are already ~1000 tokens
+  # (close to our 2048 max). Packing helps most when sequences are
+  # very short (<200 tokens). With long sequences it causes attention
+  # bleed between samples.
+
+evaluation:
+  eval_strategy: "steps"
+  eval_steps: 50
+  save_strategy: "steps"
+  save_steps: 50
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+
+logging:
+  logging_steps: 10
+  report_to: "wandb"
+  run_name: "sec-analyst-mistral7b-qlora-v1"
+
+output:
+  output_dir: "./outputs/sec-analyst-v1"
+  hub_model_id: "your-hf-username/sec-filing-analyst-mistral7b"
