@@ -133,6 +133,42 @@ def build_instruction_pair(chunk: dict, ticker: str,
         "word_count": chunk.get("word_count", 0),
     }
 
+def rebalance_dataset(pairs: list, 
+                      max_per_section: int = 250,
+                      seed: int = 42) -> list:
+    """
+    Cap overrepresented sections to prevent training bias.
+    
+    Strategy: subsample financial_statements to 250 (matching business ~),
+    keep all risk_factors and mda since those are our highest-value sections.
+    
+    Why 250? It's 2x our smallest meaningful section (mda=146 × ~1.7).
+    In production this decision goes in the data card with a rationale.
+    Alternatives considered:
+    - Weighted sampling in the DataLoader: works but adds complexity
+    - Oversampling minority classes: risk of overfitting on small sections
+    - Our approach (capping majority): simplest, most interpretable
+    """
+    random.seed(seed)
+    from collections import defaultdict
+    
+    by_section = defaultdict(list)
+    for p in pairs:
+        by_section[p["section"]].append(p)
+    
+    balanced = []
+    for section, items in by_section.items():
+        if len(items) > max_per_section:
+            sampled = random.sample(items, max_per_section)
+            print(f"  {section}: {len(items)} → {max_per_section} (capped)")
+        else:
+            sampled = items
+            print(f"  {section}: {len(items)} (kept all)")
+        balanced.extend(sampled)
+    
+    print(f"\nTotal after rebalancing: {len(balanced)} "
+          f"(was {len(pairs)})")
+    return balanced
 
 def build_dataset(processed_dir: Path, 
                   output_dir: Path,
@@ -176,7 +212,10 @@ def build_dataset(processed_dir: Path,
                 all_pairs.append(pair)
     
     print(f"\nTotal instruction pairs built: {len(all_pairs)}")
-    
+
+    print("\nRebalancing sections...")
+    all_pairs = rebalance_dataset(all_pairs, max_per_section=250)
+
     # Shuffle before splitting — important because we loaded file by file
     # so all JPM chunks come before GS chunks etc. Shuffling prevents
     # the validation set from being dominated by one company.
