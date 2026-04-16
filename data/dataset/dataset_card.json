@@ -1,0 +1,32 @@
+{
+  "total_samples": 1314,
+  "train_samples": 1116,
+  "val_samples": 198,
+  "train_ratio": 0.85,
+  "seed": 42,
+  "companies": [
+    "MET",
+    "CB",
+    "PRU",
+    "SCHW",
+    "GS",
+    "JPM",
+    "BLK",
+    "BAC",
+    "WFC"
+  ],
+  "sections": [
+    "risk_factors",
+    "quantitative_disclosures",
+    "business",
+    "mda",
+    "financial_statements"
+  ],
+  "avg_word_count": 771.1,
+  "format": "ChatML with Mistral [INST] tags",
+  "task_types": [
+    "risk_factor_extraction",
+    "mda_summarization",
+    "general_financial_analysis"
+  ]
+}
